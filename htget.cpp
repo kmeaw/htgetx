@@ -47,6 +47,10 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <malloc.h>
+
+#include <zlib.h>
+#include <direct.h>
 
 #include "types.h"
 
@@ -66,7 +70,7 @@
 #define OUTPUTFILENAME_LEN  (80)
 
 #define TCP_RECV_BUFFER  (16384)
-#define INBUFSIZE         (8192)
+#define INBUFSIZE        (16384)
 #define LINEBUFSIZE        (512)
 #define SOCK_PRINTF_SIZE  (1024)
 
@@ -79,6 +83,8 @@
 bool     Verbose = false;
 bool     QuietMode = false;
 bool     HeadersOnly = false;
+bool     UnpackMode = false;
+bool     BatchMode = false;
 bool     ShowHeaders = false;
 bool     ModifiedSince = false;
 
@@ -115,8 +121,11 @@ TcpSocket *sock;
 char lineBuffer[ LINEBUFSIZE ];
 
 uint8_t  *inBuf;                 // Input buffer
+uint8_t  *outBuf = NULL;         // Output buffer for uncompressed data
 uint16_t  inBufStartIndex = 0;   // First unconsumed char in inBuf
 uint16_t  inBufLen=0;            // Index to next char to fill
+
+z_stream strm;
 
 
 // Misc
@@ -154,40 +163,40 @@ typedef struct {
 
 ReturnCodeRec_t rcMappingTable[] = {
 
-  { 100, 199, 10 },  // Default for 100 to 199 if not mapped out
+  { 100, 199, 10, 0 },  // Default for 100 to 199 if not mapped out
 
-  { 200, 299, 20 },  // Default for 200 to 299 if not mapped out
-  { 200, 200, 21 },  // OK
-  { 201, 201, 22 },  // Created
-  { 202, 202, 23 },  // Accepted
-  { 203, 203, 24 },  // Non-Authoritative Information
-  { 204, 204, 25 },  // No Content
-  { 205, 205, 26 },  // Reset Content
-  { 206, 206, 27 },  // Partial Content
+  { 200, 299, 20, 0 },  // Default for 200 to 299 if not mapped out
+  { 200, 200, 21, 0 },  // OK
+  { 201, 201, 22, 0 },  // Created
+  { 202, 202, 23, 0 },  // Accepted
+  { 203, 203, 24, 0 },  // Non-Authoritative Information
+  { 204, 204, 25, 0 },  // No Content
+  { 205, 205, 26, 0 },  // Reset Content
+  { 206, 206, 27, 0 },  // Partial Content
 
-  { 300, 399, 30 },  // Default for 300 to 399 if not mapped out
-  { 300, 300, 31 },  // Multiple Choices
-  { 301, 301, 32 },  // Moved Permanently
-  { 302, 302, 33 },  // Found
-  { 303, 303, 34 },  // See Other
-  { 304, 304, 35 },  // Not Modified 
-  { 305, 305, 36 },  // Use Proxy
-  { 307, 307, 37 },  // Temporary Redirect
+  { 300, 399, 30, 0 },  // Default for 300 to 399 if not mapped out
+  { 300, 300, 31, 0 },  // Multiple Choices
+  { 301, 301, 32, 0 },  // Moved Permanently
+  { 302, 302, 33, 0 },  // Found
+  { 303, 303, 34, 0 },  // See Other
+  { 304, 304, 35, 0 },  // Not Modified 
+  { 305, 305, 36, 0 },  // Use Proxy
+  { 307, 307, 37, 0 },  // Temporary Redirect
 
-  { 400, 499, 40 },  // Default for 400 to 499 if not mapped out
-  { 400, 400, 41 },  // Bad Request
-  { 401, 401, 42 },  // Unauthorized
-  { 402, 402, 43 },  // Payment Required
-  { 403, 403, 44 },  // Forbidden
-  { 404, 404, 45 },  // Not Found
-  { 410, 410, 46 },  // Gone
+  { 400, 499, 40, 0 },  // Default for 400 to 499 if not mapped out
+  { 400, 400, 41, 0 },  // Bad Request
+  { 401, 401, 42, 0 },  // Unauthorized
+  { 402, 402, 43, 0 },  // Payment Required
+  { 403, 403, 44, 0 },  // Forbidden
+  { 404, 404, 45, 0 },  // Not Found
+  { 410, 410, 46, 0 },  // Gone
 
-  { 500, 599, 50 },  // Default for 500 to 599 if not mapped out
-  { 500, 500, 51 },  // Internal Server Error
-  { 501, 501, 52 },  // Not Implemented
-  { 503, 503, 53 },  // Service Unavailable
-  { 505, 505, 54 },  // HTTP Version Not Supported
-  { 509, 509, 55 },  // Bandwidth Limit Exceeded
+  { 500, 599, 50, 0 },  // Default for 500 to 599 if not mapped out
+  { 500, 500, 51, 0 },  // Internal Server Error
+  { 501, 501, 52, 0 },  // Not Implemented
+  { 503, 503, 53, 0 },  // Service Unavailable
+  { 505, 505, 54, 0 },  // HTTP Version Not Supported
+  { 509, 509, 55, 0 },  // Bandwidth Limit Exceeded
 
 };
 
@@ -402,6 +411,8 @@ void drainAndCloseSocket( void ) {
   verboseMessage( "%lu bytes read while draining the socket\n", bytesRead );
 
   sock->close( );
+
+  TcpSocketMgr::freeSocket( sock );
 }
 
 
@@ -672,12 +683,20 @@ int8_t connectSocket( void ) {
   uint16_t localport = 2048 + rand( );
 
   sock = TcpSocketMgr::getSocket( );
-  if ( sock->setRecvBuffer( TCP_RECV_BUFFER ) ) {
+  if ( sock == NULL ) {
     errorMessage( "Error creating socket\n" );
     return -1;
   }
 
-  if ( sock->connectNonBlocking( localport, HostAddr, ServerPort ) ) return -1;
+  if ( sock->setRecvBuffer( TCP_RECV_BUFFER ) ) {
+    errorMessage( "Error setting tcp recv buffer\n" );
+    return -1;
+  }
+
+  if ( sock->connectNonBlocking( localport, HostAddr, ServerPort ) ) {
+    errorMessage( "Error connecting from %d to %d\n", localport, ServerPort );
+    return -1;
+  }
 
   int8_t rc = -1;
 
@@ -737,7 +756,7 @@ int sendHeaders( void ) {
 
     verboseMessage( "Sending HTTP 1.0 request\n");
     rc = sock_printf( "%s %s HTTP/1.0\r\n"
-                          "User-Agent: mTCP HTGet " __DATE__ "\r\n",
+                          "User-Agent: mTCP HTGetX " __DATE__ "\r\n",
                           HeadersOnly ? "HEAD" : "GET",
                           Path,
                           Hostname );
@@ -746,7 +765,7 @@ int sendHeaders( void ) {
 
     verboseMessage( "Sending HTTP 1.1 request\n");
     rc = sock_printf( "%s %s HTTP/1.1\r\n"
-                          "User-Agent: mTCP HTGet " __DATE__ "\r\n"
+                          "User-Agent: mTCP HTGetX " __DATE__ "\r\n"
                           "Host: %s\r\n"
                           "Connection: close\r\n",
                           HeadersOnly ? "HEAD" : "GET",
@@ -775,6 +794,10 @@ int sendHeaders( void ) {
                       mtime->tm_hour, mtime->tm_min, mtime->tm_sec );
     if ( rc ) return -1;
   }
+
+  rc = sock_printf( "Accept-Encoding: gzip\r\n" );
+  if ( rc ) return -1;
+  verboseMessage( "Accepting gzip.\n");
 
   rc = sock_printf( "\r\n" );
   if ( rc ) return -1;
@@ -809,7 +832,7 @@ int8_t readHeaders( void ) {
   if (ShowHeaders) fprintf( stderr, "\n%s\n", lineBuffer );
 
   if ( (strncmp(lineBuffer, "HTTP/1.0", 8) != 0) && (strncmp(lineBuffer, "HTTP/1.1", 8) != 0) ) {
-    errorMessage( "Not an HTTP 1.0 or 1.1 server\n" );
+    errorMessage( "Not an HTTP 1.0 or 1.1 server: %s\n", lineBuffer );
     return -1;
   }
 
@@ -823,7 +846,7 @@ int8_t readHeaders( void ) {
     s++;
   }
 
-  if ( (s == s2) || (*s == 0) || (sscanf(s, "%3d", &response) != 1) ) {
+  if ( (s == s2) || (*s == 0) || (sscanf(s, "%3hd", &response) != 1) ) {
     errorMessage( "Malformed HTTP version line\n" );
     return -1;
   }
@@ -835,6 +858,7 @@ int8_t readHeaders( void ) {
     errorMessage( "Server return code: %s\n", s );
   }
 
+  UnpackMode = false;
 
   while ( sock_getline( lineBuffer ) == 0 ) {
 
@@ -850,7 +874,10 @@ int8_t readHeaders( void ) {
       ExpectedContentLength = atol(s);
       ExpectedContentLengthSent = true;
     }
-    else if (strnicmp(lineBuffer, "Location:", 9 ) == 0) {
+    else if (strnicmp(lineBuffer, "Content-Encoding: gzip", 22 ) == 0) {
+        verboseMessage("Server response contains gzipped data.\n");
+        UnpackMode = true;
+    } else if (strnicmp(lineBuffer, "Location:", 9 ) == 0) {
       if (response == 301 || response == 302) {
         if (!HeadersOnly) {
           errorMessage( "New location: %s\n", lineBuffer+10 );
@@ -894,12 +921,53 @@ void fileWriteError( int localErrno ) {
 
 
 int fileWriter( uint8_t *buffer, uint16_t bufferLen, FILE *outputFile ) {
-  // Remember, fwrite only fails this check if there is an error.
-  if ( fwrite( buffer, 1, bufferLen, outputFile ) != bufferLen ) {
-    int localErrno = errno;
-    fileWriteError( localErrno );
-    return 1;
+  if ( UnpackMode ) {
+      char spinner[4] = "/-\|";
+      char spin = 0;
+      strm.avail_in = bufferLen;
+      strm.next_in = buffer;
+      int ret;
+      do {
+          strm.avail_out = INBUFSIZE;
+
+          outBuf = (uint8_t *) (outBuf != NULL ? realloc (outBuf, strm.avail_out) : malloc(strm.avail_out));
+          if (!outBuf) {
+              errorMessage("cannot allocate outBuf\n");
+              return 1;
+          }
+          strm.next_out = outBuf;
+          ret = inflate(&strm, Z_NO_FLUSH);
+          if (ret == Z_STREAM_ERROR) {
+              return 1;
+          }
+          switch (ret) {
+          case Z_NEED_DICT:
+              ret = Z_DATA_ERROR;     /* and fall through */
+          case Z_DATA_ERROR:
+          case Z_MEM_ERROR:
+              errorMessage("zlib inflate error\n");
+              (void)inflateEnd(&strm);
+              return ret;
+          }
+          if ( fwrite (outBuf, 1, INBUFSIZE - strm.avail_out, outputFile) != INBUFSIZE - strm.avail_out) {
+              int localErrno = errno;
+              fileWriteError( localErrno );
+              inflateEnd (&strm);
+              return 1;
+          }
+          verboseMessage("fwrite %d bytes\n", INBUFSIZE - strm.avail_out);
+          fprintf(stderr, "%c\b", spinner[spin++]);
+          spin %= 4;
+      } while (strm.avail_out == 0);
+  } else {
+      // Remember, fwrite only fails this check if there is an error.
+      if ( fwrite( buffer, 1, bufferLen, outputFile ) != bufferLen ) {
+        int localErrno = errno;
+        fileWriteError( localErrno );
+        return 1;
+      }
   }
+  fprintf(stderr, ".");
   return 0;
 }
 
@@ -1143,6 +1211,9 @@ int readContent( void ) {
 
   } // end big while
 
+  if ( UnpackMode ) {
+      inflateEnd (&strm);
+  }
 
   verboseMessage( "Receive content exit: %s\n", StopCodeStrings[stopCode] );
 
@@ -1152,6 +1223,7 @@ int readContent( void ) {
     return -1;
   }
     
+  fprintf(stderr, " \n");
 
   int rc = -1;
 
@@ -1171,7 +1243,7 @@ int readContent( void ) {
 
 
 
-static char CopyrightMsg1[] = "mTCP HTGet by M Brutman (mbbrutman@gmail.com) (C)opyright 2011-2020\n";
+static char CopyrightMsg1[] = "mTCP HTGet by M Brutman (mbbrutman@gmail.com) (C)opyright 2011-2020\nModified by kmeaw for the Wyse S10 retrogaming project\n";
 static char CopyrightMsg2[] = "Version: " __DATE__ "\n\n";
 
 char *HelpText = {
@@ -1188,6 +1260,7 @@ char *HelpText = {
   "  -09                      Use HTTP 0.9 protocol\n"
   "  -10                      Use HTTP 1.0 protocol\n"
   "  -11                      Use HTTP 1.1 protocol (default)\n\n"
+  "  -x                       Enable compression and batch interpreter\n\n"
   "Press Ctrl-Break or ESC during a transfer to abort\n\n"
 };
 
@@ -1216,9 +1289,11 @@ static void parseArgs( int argc, char *argv[] ) {
       usageError( NULL, NULL );
     }
     else if ( stricmp( argv[i], "-quiet" ) == 0 ) {
+      Verbose = false;
       QuietMode = true;
     }
     else if ( stricmp( argv[i], "-v" ) == 0 ) {
+      QuietMode = false;
       Verbose = true;
     }
     else if ( stricmp( argv[i], "-headers" ) == 0 ) {
@@ -1244,6 +1319,10 @@ static void parseArgs( int argc, char *argv[] ) {
 
       strncpy( outputFilename, argv[i], OUTPUTFILENAME_LEN );
       outputFilename[ OUTPUTFILENAME_LEN - 1 ] = 0;
+    }
+    else if ( stricmp( argv[i], "-x" ) == 0 ) {
+      QuietMode = true;
+      BatchMode = true;
     }
     else if ( stricmp( argv[i], "-m" ) == 0 ) {
       ModifiedSince = true;
@@ -1275,6 +1354,10 @@ static void parseArgs( int argc, char *argv[] ) {
 
   if ( ModifiedSince && (*outputFilename == 0) ) {
     usageError( "%s", "Need to specify a filename with -o if using -m\n" );
+  }
+
+  if ( UnpackMode && (*outputFilename == 0) ) {
+    usageError( "%s", "Need to specify a filename with -x\n" );
   }
 
 
@@ -1381,8 +1464,182 @@ void probeStdout( void ) {
 }
 
 
-int main( int argc, char *argv[] ) {
+inline void eatSpaces( char **s ) {
+      while (**s != 0) {
+          if (**s == ' ') {
+              (*s)++;
+          } else {
+              break;
+          }
+      }
+}
 
+inline void findSpace( char **s ) {
+      while (**s != 0) {
+          if (**s == '\n' || **s == ' ') {
+              break;
+          }
+          (*s)++;
+      }
+}
+
+
+bool batch_echo = true;
+char batch_label[16] = {0,};
+
+bool eval(char *lineBuffer, int depth=0) {
+    char *s = lineBuffer;
+    char *e;
+    eatSpaces( &s );
+    if ( strlen(s) == 0) {
+        return false;
+    }
+    if (batch_label[0] != 0) {
+        if ( *s == ':') {
+            e = s + 1;
+            findSpace( &e );
+            *e = 0;
+            if (strnicmp( s + 1, batch_label, sizeof(batch_label) - 1 ) == 0 ) {
+                batch_label[0] = 0;
+            }
+        } else {
+            return false;
+        }
+    }
+    if (*s == '@') {
+        s++;
+    } else if (batch_echo) {
+        for(int i = 0; i < depth; i++) {
+            fprintf( stderr, "... " );
+        }
+        fprintf( stderr, "%s", s );
+    }
+    if ( strnicmp( s, "rem", 3 ) == 0 ) {
+        return false;
+    } else if ( strnicmp( s, "echo.", 5 ) == 0 ) {
+        fprintf ( stderr, "\n" );
+    } else if ( strnicmp( s, "echo", 4 ) == 0 ) {
+        s = s + 4;
+        eatSpaces( &s );
+        if ( strnicmp( s, "off", 3 ) == 0 ) {
+            batch_echo = false;
+        } else if ( strnicmp( s, "on", 2 ) == 0 ) {
+            batch_echo = true;
+        } else {
+            e = strchr (lineBuffer + 5, '>');
+            if (e) {
+                *e = 0;
+                s = e - 1;
+                e++;
+                while (s > lineBuffer + 5) {
+                    if (*s != ' ') {
+                        break;
+                    }
+                    *s = 0;
+                    s--;
+                }
+                char *mode = "w";
+                if (*e == '>') {
+                    mode = "a";
+                    e++;
+                }
+                eatSpaces( &e );
+                s = e + 1;
+                findSpace( &s );
+                *s = 0;
+                FILE *f = fopen( e, mode );
+                if ( f == NULL ) {
+                    errorMessage( "cannot open file %s with mode %s\n", e, mode );
+                } else {
+                    fprintf( f, "%s\n", lineBuffer + 5 );
+                    fclose( f );
+                }
+            } else {
+                fprintf( stderr, "%s", lineBuffer + 5 );
+            }
+        }
+    } else if ( strnicmp( s, "if exist", 8 ) == 0 ) {
+        s = lineBuffer + 8;
+        eatSpaces(&s);
+        e = s + 1;
+        findSpace(&e);
+        *e++ = 0;
+        if ( access ( s, F_OK ) == 0 ) {
+            eatSpaces(&e);
+            eval(e, depth+1);
+        }
+    } else if ( strnicmp( s, "md", 2 ) == 0 ) {
+        s = lineBuffer + 2;
+        eatSpaces(&s);
+        e = s + 1;
+        findSpace(&e);
+        *e = 0;
+        mkdir(s);
+    } else if ( strnicmp( s, "rd", 2 ) == 0 ) {
+        s = lineBuffer + 2;
+        eatSpaces(&s);
+        e = s + 1;
+        findSpace(&e);
+        *e = 0;
+        rmdir(s);
+    } else if ( strnicmp( s, "goto", 4 ) == 0 ) {
+        s = lineBuffer + 4;
+        eatSpaces(&s);
+        e = s + 1;
+        findSpace(&e);
+        *e = 0;
+        strncpy(batch_label, s, sizeof(batch_label) - 1);
+    } else if ( strnicmp( s, "call", 4 ) == 0 ) {
+        s = lineBuffer + 4;
+        eatSpaces(&s);
+        e = s + 1;
+        findSpace(&e);
+        *e = 0;
+        system(s);
+    } else if ( strnicmp( s, "htget -quiet -o ", 16 ) == 0 ) {
+        s = lineBuffer + 16;
+        e = s;
+        findSpace(&e);
+        *e++ = 0;
+        strncpy(outputFilename, s, sizeof(outputFilename) - 1);
+        s = e;
+        if ( strnicmp( s, "http://", 7 ) != 0) {
+            errorMessage("Unexpected token: %s\n", s);
+            return false;
+        }
+
+        findSpace(&e);
+        if (*e != '\n') {
+            errorMessage("Unexpected token: %s\n", e);
+            return false;
+        }
+        *e = 0;
+
+        s = strchr( s + 7, '/' );
+        if ( s == NULL ) {
+            Path[0] = '/';
+            Path[1] = 0;
+        } else {
+            strncpy( Path, s, PATH_LEN );
+        }
+        
+        return true;
+    } else if (*s == ':') {
+        return false;
+    } else {
+        e = s + strlen(s) - 1;
+        while (e > s && (*e == '\n' || *e == ' ')) {
+            *e-- = 0;
+        }
+
+        system( s );
+    }
+
+    return false;
+}
+
+
+int main( int argc, char *argv[] ) {
   probeStdout( );
 
   parseArgs( argc, argv );
@@ -1394,7 +1651,7 @@ int main( int argc, char *argv[] ) {
 
   // Allocate memory
 
-  inBuf = (uint8_t *)malloc( INBUFSIZE );
+  inBuf = (uint8_t *) malloc ( INBUFSIZE );
   if ( !inBuf ) {
     errorMessage( "Error: Could not allocate memory\n" );
     exit(1);
@@ -1443,7 +1700,9 @@ int main( int argc, char *argv[] ) {
   // From this point forward you have to call the shutdown( ) routine to
   // exit because we have the timer interrupt hooked.
 
+  FILE *batch = NULL;
 
+next:
   // Resolve and connect
 
   verboseMessage( "Server: %s:%u\nPath: %s\n", Hostname, ServerPort, Path );
@@ -1462,7 +1721,6 @@ int main( int argc, char *argv[] ) {
     shutdown( 1 );
   }
 
-
   int rc;
 
   if ( HeadersOnly || (ExpectedContentLengthSent && (ExpectedContentLength == 0)) || (NotModified) ) {
@@ -1476,11 +1734,45 @@ int main( int argc, char *argv[] ) {
 
   } else {
 
+    if ( UnpackMode ) {
+        strm.zalloc = Z_NULL;
+        strm.zfree = Z_NULL;
+        strm.opaque = Z_NULL;
+        strm.avail_in = 0;
+        strm.next_in = Z_NULL;
+        rc = inflateInit2(&strm, 16+MAX_WBITS);
+        if ( rc != Z_OK ) {
+            errorMessage( "Error initializing zlib\n" );
+            shutdown( 1 );
+        }
+    }
     rc = readContent( );
 
   }
 
   drainAndCloseSocket( );
+
+  if ( BatchMode ) {
+      if ( batch == NULL ) {
+          batch = fopen( outputFilename, "r" );
+      }
+      while (fgets( lineBuffer, LINEBUFSIZE, batch ) != NULL) {
+          if (eval( lineBuffer )) {
+              memset (lineBuffer, 0, sizeof(lineBuffer));
+              inBufStartIndex = 0;
+              inBufLen=0;
+              NotModified = false;
+              TransferEncoding_Chunked = false;
+              ExpectedContentLengthSent = false;
+              ExpectedContentLength = 0;
+              HttpResponse = 500;
+
+              goto next;
+          }
+      }
+      fclose( batch );
+      shutdown( 0 );
+  }
 
   if ( rc == 0 ) {
     rc = mapResponseCode( HttpResponse );

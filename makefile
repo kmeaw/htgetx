@@ -25,24 +25,25 @@
 
 # Make it fast.  But don't use -oe otherwise you'll need large model.
 
-tcp_h_dir = ..\..\TCPINC\
-tcp_c_dir = ..\..\TCPLIB\
-common_h_dir = ..\..\INCLUDE
+tcp_h_dir = ../../tcpinc/
+tcp_c_dir = ../../tcplib/
+common_h_dir = ../../include
 
 memory_model = -ml
-compile_options = -0 $(memory_model) -DCFG_H="htget.cfg" -oh -ok -ot -s -oa -ei -zp2 -zpw -we -ob -ol+ -oi+
+compile_options = -0 $(memory_model) '-DCFG_H="htget.cfg"' -oh -ok -ot -s -oa -ei -zp2 -zpw -we -ob -ol+ -oi+
+c_compile_options = -0 $(memory_model) -oh -ok -ot -s -oa -ei -zp2 -zpw -we -ob
 compile_options += -i=$(tcp_h_dir) -i=$(common_h_dir)
 
 
-tcpobjs = packet.obj arp.obj eth.obj ip.obj tcp.obj tcpsockm.obj udp.obj utils.obj dns.obj timer.obj ipasm.obj trace.obj
-objs = htget.obj
+tcpobjs = packet.o arp.o eth.o ip.o tcp.o tcpsockm.o udp.o utils.o dns.o timer.o ipasm.o trace.o
+objs = htget.o
 
 all : clean htget.exe
 
 clean : .symbolic
-  @del htget.exe
-  @del *.obj
-  @del *.map
+  @rm -f htget.exe
+  @rm -f *.o
+  @rm -f *.map
 
 patch : .symbolic
   ..\..\utils\ptach htget.exe htget.map $(memory_model)
@@ -51,12 +52,15 @@ patch : .symbolic
 
 .cpp : $(tcp_c_dir)
 
-.asm.obj :
+.c.o : 
+  wcc $[* $(c_compile_options)
+
+.asm.o :
   wasm -0 $(memory_model) $[*
 
-.cpp.obj :
+.cpp.o :
   wpp $[* $(compile_options)
 
 
 htget.exe: $(tcpobjs) $(objs)
-  wlink system dos option map option eliminate option stack=4096 name $@ file *.obj
+  wlink option verbose system dos option map option eliminate option stack=4096 name $@ file packet.o file arp.o file eth.o file ip.o file tcp.o file tcpsockm.o file udp.o file utils.o file dns.o file timer.o file ipasm.o file trace.o file htget.o
