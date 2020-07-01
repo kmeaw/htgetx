@@ -76,6 +76,8 @@
 
 #define CONNECT_TIMEOUT  (10000ul)
 
+#define HTTP_RETRIES 5
+
 
 
 // Options set by user supplied args
@@ -1597,6 +1599,7 @@ bool eval(char *lineBuffer, int depth=0) {
         *e = 0;
         system(s);
     } else if ( strnicmp( s, "htget -quiet -o ", 16 ) == 0 ) {
+        retries = HTTP_RETRIES;
         s = lineBuffer + 16;
         e = s;
         findSpace(&e);
@@ -1701,24 +1704,53 @@ int main( int argc, char *argv[] ) {
   // exit because we have the timer interrupt hooked.
 
   FILE *batch = NULL;
+  int retries = HTTP_RETRIES;
 
 next:
   // Resolve and connect
 
   verboseMessage( "Server: %s:%u\nPath: %s\n", Hostname, ServerPort, Path );
 
-  if ( resolve(Hostname, HostAddr) ) shutdown( 1 );
+  if ( resolve(Hostname, HostAddr) ) {
+    if ( BatchMode && retries > 0) {
+      sleep( 1 );
+      retries--;
+      goto next;
+    } else {
+      shutdown( 1 );
+    }
+  }
 
-  if ( connectSocket( ) ) shutdown( 1 );
+  if ( connectSocket( ) ) {
+    if ( BatchMode && retries > 0) {
+      sleep( 1 );
+      retries--;
+      goto next;
+    } else {
+      shutdown( 1 );
+    }
+  }
 
   if ( sendHeaders( ) ) {
     errorMessage( "Error sending HTTP request\n" );
-    shutdown( 1 );
+    if ( BatchMode && retries > 0) {
+      sleep( 1 );
+      retries--;
+      goto next;
+    } else {
+      shutdown( 1 );
+    }
   }
 
   if ( readHeaders( ) ) {
     errorMessage( "Error reading HTTP headers\n" );
-    shutdown( 1 );
+    if ( BatchMode && retries > 0) {
+      sleep( 1 );
+      retries--;
+      goto next;
+    } else {
+      shutdown( 1 );
+    }
   }
 
   int rc;
@@ -1779,6 +1811,12 @@ next:
   }
   else {
     rc = 1;
+  }
+
+  free ( inBuf );
+  if ( outBuf != NULL ) {
+    free ( outBuf );
+    outBuf = NULL;
   }
 
   shutdown( rc );
