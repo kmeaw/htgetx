@@ -1732,6 +1732,7 @@ next:
 
   if ( connectSocket( ) ) {
     if ( BatchMode && retries > 0) {
+      sock->close( );
       sleep( 1 );
       retries--;
       goto next;
