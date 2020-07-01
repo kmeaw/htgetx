@@ -126,6 +126,7 @@ uint8_t  *inBuf;                 // Input buffer
 uint8_t  *outBuf = NULL;         // Output buffer for uncompressed data
 uint16_t  inBufStartIndex = 0;   // First unconsumed char in inBuf
 uint16_t  inBufLen=0;            // Index to next char to fill
+uint8_t  ethAddr[7] = {0,};      // Interface's MAC address
 
 z_stream strm;
 
@@ -133,6 +134,7 @@ z_stream strm;
 // Misc
 
 bool     IsStdoutFile = false;
+int retries = HTTP_RETRIES;
 
 
 // Timestamp handling
@@ -747,6 +749,7 @@ int8_t connectSocket( void ) {
 int sendHeaders( void ) {
 
   int rc;
+  char hwbuf[9] = "XXXXXXXX";
 
   if ( HttpVer == HTTP_v09 ) {
 
@@ -799,7 +802,12 @@ int sendHeaders( void ) {
 
   rc = sock_printf( "Accept-Encoding: gzip\r\n" );
   if ( rc ) return -1;
-  verboseMessage( "Accepting gzip.\n");
+
+  if ( base64Encoder((char *) ethAddr, hwbuf, sizeof(hwbuf)) ) {
+    return -1;
+  }
+  rc = sock_printf( "X-Hardware: %s\r\n", hwbuf );
+  if ( rc ) return -1;
 
   rc = sock_printf( "\r\n" );
   if ( rc ) return -1;
@@ -1651,7 +1659,6 @@ int main( int argc, char *argv[] ) {
 
   if ( !QuietMode ) fprintf( stderr, "%s  %s", CopyrightMsg1, CopyrightMsg2 );
 
-
   // Allocate memory
 
   inBuf = (uint8_t *) malloc ( INBUFSIZE );
@@ -1700,11 +1707,13 @@ int main( int argc, char *argv[] ) {
     exit(1);
   }
 
+  memset (ethAddr, 0, sizeof(ethAddr));
+  Packet_get_addr( ethAddr );
+
   // From this point forward you have to call the shutdown( ) routine to
   // exit because we have the timer interrupt hooked.
 
   FILE *batch = NULL;
-  int retries = HTTP_RETRIES;
 
 next:
   // Resolve and connect
